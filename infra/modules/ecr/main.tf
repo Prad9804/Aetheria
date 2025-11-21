@@ -1,161 +1,156 @@
-# Application Load Balancer
-resource "aws_lb" "main" {
-  name               = var.name
-  internal           = false
-  load_balancer_type = "application"
-  security_groups    = [aws_security_group.alb.id]
-  subnets           = var.public_subnets
+# ECR Repositories for each microservice
+resource "aws_ecr_repository" "services" {
+  for_each = toset(var.ecr_repositories)
 
-  enable_deletion_protection = var.enable_deletion_protection
+  name                 = each.value
+  image_tag_mutability = "MUTABLE"
 
-  # Enable access logs
-  dynamic "access_logs" {
-    for_each = var.enable_access_logs ? [1] : []
-    content {
-      bucket  = var.logs_bucket_name
-      prefix  = "alb"
-      enabled = true
-    }
+  # Enable image scanning for security
+  image_scanning_configuration {
+    scan_on_push = true
   }
 
-  tags = var.tags
-}
-
-# ALB Security Group
-resource "aws_security_group" "alb" {
-  name_prefix = "${var.name}-alb"
-  vpc_id      = var.vpc_id
-
-  ingress {
-    description = "HTTP"
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  ingress {
-    description = "HTTPS"
-    from_port   = 443
-    to_port     = 443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  egress {
-    description = "All outbound traffic"
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+  # Encryption configuration
+  encryption_configuration {
+    encryption_type = "AES256"
   }
 
   tags = merge(var.tags, {
-    Name = "${var.name}-alb-sg"
+    Service = each.value
   })
 }
 
-# Target Group for Web Application
-resource "aws_lb_target_group" "web" {
-  name     = "${var.name}-web-tg"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = var.vpc_id
+# ECR Lifecycle policies for cost optimization
+resource "aws_ecr_lifecycle_policy" "services" {
+  for_each = aws_ecr_repository.services
 
-  health_check {
-    enabled             = true
-    healthy_threshold   = 2
-    interval            = 30
-    matcher             = "200"
-    path                = var.health_check_path
-    port                = "traffic-port"
-    protocol            = "HTTP"
-    timeout             = 5
-    unhealthy_threshold = 2
-  }
+  repository = each.value.name
+
+  policy = jsonencode({
+    rules = [
+      {
+        rulePriority = 1
+        description  = "Keep last 10 production images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["prod", "production"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 10
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 2
+        description  = "Keep last 5 staging images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["staging", "stage"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 5
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 3
+        description  = "Keep last 3 development images"
+        selection = {
+          tagStatus     = "tagged"
+          tagPrefixList = ["dev", "develop", "feature"]
+          countType     = "imageCountMoreThan"
+          countNumber   = 3
+        }
+        action = {
+          type = "expire"
+        }
+      },
+      {
+        rulePriority = 4
+        description  = "Delete untagged images older than 1 day"
+        selection = {
+          tagStatus   = "untagged"
+          countType   = "sinceImagePushed"
+          countUnit   = "days"
+          countNumber = 1
+        }
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
+}
+
+# ECR Repository policy for cross-account access (if needed)
+resource "aws_ecr_repository_policy" "services" {
+  for_each = aws_ecr_repository.services
+
+  repository = each.value.name
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowEKSAccess"
+        Effect = "Allow"
+        Principal = {
+          AWS = [
+            var.cluster_iam_role_arn,
+            "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root"
+          ]
+        }
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:GetAuthorizationToken"
+        ]
+      }
+    ]
+  })
+}
+
+# IAM policy for ECR access from EKS nodes
+resource "aws_iam_policy" "ecr_access" {
+  name_prefix = "${var.name}-ecr-access"
+  description = "Policy for EKS nodes to access ECR repositories"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:BatchCheckLayerAvailability",
+          "ecr:BatchGetImage",
+          "ecr:GetDownloadUrlForLayer",
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = [
+          for repo in aws_ecr_repository.services : repo.arn
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 
   tags = var.tags
 }
 
-# Target Group for API
-resource "aws_lb_target_group" "api" {
-  name     = "${var.name}-api-tg"
-  port     = 80
-  protocol = "HTTP"
-  vpc_id   = var.vpc_id
-
-  health_check {
-    enabled             = true
-    healthy_threshold   = 2
-    interval            = 30
-    matcher             = "200"
-    path                = "/health"
-    port                = "traffic-port"
-    protocol            = "HTTP"
-    timeout             = 5
-    unhealthy_threshold = 2
-  }
-
-  tags = var.tags
+# Attach ECR policy to node group role
+resource "aws_iam_role_policy_attachment" "node_group_ecr_access" {
+  policy_arn = aws_iam_policy.ecr_access.arn
+  role       = var.node_group_iam_role_name
 }
 
-# HTTPS Listener
-resource "aws_lb_listener" "https" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = "443"
-  protocol          = "HTTPS"
-  ssl_policy        = "ELBSecurityPolicy-TLS-1-2-2017-01"
-  certificate_arn   = var.acm_certificate_arn
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.web.arn
-  }
-
-  tags = var.tags
-}
-
-# HTTP Listener (redirect to HTTPS)
-resource "aws_lb_listener" "http" {
-  load_balancer_arn = aws_lb.main.arn
-  port              = "80"
-  protocol          = "HTTP"
-
-  default_action {
-    type = "redirect"
-
-    redirect {
-      port        = "443"
-      protocol    = "HTTPS"
-      status_code = "HTTP_301"
-    }
-  }
-
-  tags = var.tags
-}
-
-# Listener Rules for API
-resource "aws_lb_listener_rule" "api" {
-  listener_arn = aws_lb_listener.https.arn
-  priority     = 100
-
-  action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.api.arn
-  }
-
-  condition {
-    host_header {
-      values = var.api_hostnames
-    }
-  }
-
-  tags = var.tags
-}
-
-# WAF Association
-resource "aws_wafv2_web_acl_association" "alb" {
-  count        = var.waf_web_acl_arn != null ? 1 : 0
-  resource_arn = aws_lb.main.arn
-  web_acl_arn  = var.waf_web_acl_arn
-}
+# Data sources
+data "aws_caller_identity" "current" {}
